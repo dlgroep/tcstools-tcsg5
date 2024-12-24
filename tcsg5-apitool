@@ -58,8 +58,10 @@ local $::csrfile="AUTO";
 local $::profile="OV";
 local $::keytype="rsa:4096";
 local $::httpagent = "tcsg5-apitool/0.02 (DLG Nikhef NL v20241224)";
+local $::openssl = "openssl";
 local $::verb = 0;
 local $::dry = 0;
+my $ossl_available=0;
 my $friendlyname;
 my $jsonfile;
 my $jsonfiledate=0;
@@ -105,6 +107,8 @@ if ( $help or $#ARGV < -1 ) {
 # ###########################################################################
 # initialise context and retrieve ephemeral connection data
 #
+$ossl_available = &openssl_isavailable($::openssl);
+
 my ($cm_domain,$cookie_jar,$ua,$res);
 ( $cm_domain = $::cm_endpoint ) =~ s/^https?:\/\///;
 $cookie_jar = HTTP::Cookies->new( ignore_discard => 1 );
@@ -148,7 +152,7 @@ if ( $res->decoded_content =~
     /^[a-z0-9][-a-z0-9=\/]+\.[-a-z0-9=\/]+\.[-a-z0-9=\/_]+$/i ) { # got a JWT
     # strip off any line endings not part of the JWT
     ($webtoken=$res->decoded_content) =~ s/[\r\n]*$//;
-    $::verb and print "Authorization JWT: $webtoken\n";
+    $::verb >= 2 and print "Authorization JWT: $webtoken\n";
     $ua->default_header('Authorization' => "$webtoken");
 } else {
     die "This response to the Login2FA was not expected (I wanted a JWT).\n";
@@ -224,17 +228,21 @@ if ( $command eq "req" ) {
     $csr=""; $modulus="unknown";
     if ( $::csrfile eq "AUTO" or $::csrfile eq "auto" ) {
 
-        system("openssl req -new -nodes -newkey $::keytype -outform pem".
+        die "This mode needs OpenSSL available, but $::openssl not found\n"
+            unless $ossl_available;
+
+        system("$::openssl req -new -nodes -newkey $::keytype -outform pem".
             " -out \"$dirname/request-$fname.pem\" -keyout \"$dirname/key-$fname.pem\"".
             " -subj \"/CN=$fname\"");
         die "Did not find the generated request for $fname in $dirname\n" unless ( -s "$dirname/request-$fname.pem" );
-        system("openssl req -in \"$dirname/request-$fname.pem\" -text -out \"$dirname/request-$fname.txt\"");
+        system("$::openssl req -in \"$dirname/request-$fname.pem\" -text -out \"$dirname/request-$fname.txt\"");
 
         open my $fh, '<', "$dirname/request-$fname.pem" or die "Can't open file $dirname/request-$fname.pem: $!\n";
         $csr = do { local $/; <$fh> };
         close $fh;
 
-        $modulus = `openssl req -noout -modulus -in \"$dirname/request-$fname.pem\"`;
+        $modulus = `$::openssl req -noout -modulus -in \"$dirname/request-$fname.pem\"`;
+        chomp($modulus);
         $modulus =~ s/^.*=\s*//;
         die "Generated CSR is not valid (no modulus)\n" unless $modulus =~ /^[0-9A-F]+$/i;
 
@@ -338,6 +346,14 @@ elsif ( $command eq "get" or $command eq "dl" ) {
             print $fh $certdata{'pemBundle'};
             close $fh;
         };
+        open $fh,">$dirname/bundle-$fname.p7c" and do {
+            print $fh $certdata{'pKCS7'};
+            close $fh;
+        };
+        if ( $ossl_available ) {
+            system("openssl pkcs7 -in \"$dirname/bundle-$fname.p7c\" ".
+                "-outform der -out \"$dirname/bundle-$fname.p7b\"");
+        }
 
         # split up the pemBundle into individual certs
         my (@certs,@blines);
@@ -515,6 +531,27 @@ sub mk_certdir() {
     return $dirname;
 }
 
+sub openssl_isavailable() {
+    my ($ossl) = @_;
+
+    $ossl = $::openssl unless $ossl;
+
+    my $ossl_available = 0;
+    my ($osslh,$osslrc);
+    $osslrc = open $osslh,"-|", "$::openssl version 2>/dev/null";
+    if ( $osslrc ) {
+        my $ossl_version = <$osslh>;
+        close $osslh;
+        if ( defined $ossl_version )  {
+            chomp($ossl_version);
+            $ossl_version =~ s/^OpenSSL\s+(\S+)\s+.*$/$1/igm;
+            $::verb >= 2 and print "Openssl version $ossl_version available as $::openssl\n";
+            $ossl_available = 1;
+        }
+    }
+    return $ossl_available;
+}
+
 # ###########################################################################
 # display a UA web call result
 # 
@@ -528,14 +565,14 @@ sub ua_call() {
     die "Invalid call (no call specificied)\n" unless $call;
 
     if ( $call =~ /^post$/i ) {
-        if ( $::verb > 1 ) { 
+        if ( $::verb >= 3 ) { 
             print "LWP POST $::cm_endpoint$endpoint";
             $data{'Content'} and do print " with $data{'Content'}";
             print "\n";
         }
         $res = $ua->post("$::cm_endpoint$endpoint", %data );
     } elsif ( $call =~ /^get$/i ) {
-        if ( $::verb > 1 ) { 
+        if ( $::verb >=3 ) { 
             print "LWP GET $::cm_endpoint$endpoint";
         }
         $res = $ua->get("$::cm_endpoint$endpoint");
@@ -553,10 +590,12 @@ sub uares_display() {
     my ($res) = @_;
 
     if ( $res->is_success) {
-        if ( $::verb > 1 ) {
+        if ( $::verb >= 3 ) {
             printf "----- %-38s ---------------------------------\n",$res->status_line;
-            #print $res->headers_as_string();
-            #print "-----------------------------------------------------------------------------\n";
+            if ( $::verb >= 5 ) {
+                print $res->headers_as_string();
+                print "-----------------------------------------------------------------------------\n";
+            }
             my $lines=0;
             foreach ( split /\n/,$res->decoded_content ) {
                 print "  $_\n";
@@ -567,7 +606,8 @@ sub uares_display() {
         }
         my $indexcontent=$res->decoded_content;
         if ( $indexcontent =~ /__RequestVerificationToken\"[^>]*value=\"([^\"]+)\"/ ) {
-          print "NOTE: found RVToken $1\n";
+            print "NOTE: found RVToken $1\n";
+            print "-----------------------------------------------------------------------------\n";
         }
         return 1;
     } else {
@@ -597,7 +637,7 @@ sub ua_update_rvtoken() {
       return undef;
     }
     $RVresponse = $1;
-    $::verb and print "Updated RVToken from GET $::cm_endpoint to $RVresponse\n";
+    $::verb >= 2 and print "Updated RVToken from GET $::cm_endpoint to $RVresponse\n";
     $uaref->default_header('RequestVerificationToken' => "$RVresponse");
     return $RVresponse;
 }
@@ -729,7 +769,7 @@ Usage: $progname [-s andOTPfile.json] [-e endpoint] [-t tokenname]
                     (the default is AUTO, which creates a fresh $::keytype
                     request in a subdirectory names after the first
                     domain name, i.e. cert's friendlyName)
-                    AUTO requests need `openssl` to be installed
+                    AUTO requests need `$::openssl` to be installed
     -F name         name used for request and directory naming
     -O orgname      organisation name to use for OV/EV issuance (required if
                     more than one org matches the given domainlist)
