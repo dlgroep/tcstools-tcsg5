@@ -1,0 +1,814 @@
+#! /usr/bin/perl -w
+#
+# TCS Generation 5 API test script
+# please bear with us as we improve both code quality and readability
+# for now, this script can do 2FA login, request an organisation based 
+# on the primary domain requested (or uses nikhef.nl if you do not request
+# any server certificates) and file a request for a series of domain names
+# given an (SAN-free) CSR in PEM format.
+#
+# This is mainly intended to demonstrate how to use the HARICA API as of
+# December 2024. This API may change over time, so check the official HARICA
+# documentation at https://developer.harica.gr/ and 
+# https://guides.harica.gr/docs/Guides/Developer/3.-Request-for-SSL-Certificate-Prevalidated-Domains/
+#
+# This is part of the Nikhef PDP Experimental Services initiative. See
+# https://www.nikhef.nl/pdp/doc/experimental-services for what this means
+# for your favoured pets.
+#
+# ---------------------------------------------------------------------------
+# Copyright 2024 David Groep, Nikhef, Amsterdam
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ---------------------------------------------------------------------------
+#
+#
+use strict;
+use POSIX;
+use Getopt::Long qw(:config no_ignore_case bundling);
+use Term::ReadKey;
+use JSON;
+use MIME::Base32;
+use Digest::HMAC_SHA1 qw/ hmac_sha1_hex /;
+use LWP;
+use LWP::UserAgent;
+use HTTP::Cookies;
+use Data::Dumper;
+use open qw( :std :encoding(UTF-8) );
+use utf8;
+
+# default values - can be overwritten in the dotrc files
+local $::cmusername = 'emailaddress@example.org';
+local $::cmpasswordfile = "/media/security/ephemeral/cm-stg-user.passphrase";
+local $::tokensecjsonpat=$ENV{"ANDOTPJSON"}?$ENV{"ANDOTPJSON"}:"/media/totp-usability/otp_accounts_*.json";
+local $::cm_endpoint = "https://cm-stg.harica.gr";
+local $::tokenname = "HARICA STG MYSELF";
+local $::orgname = undef;
+local $::csrfile="AUTO";
+local $::profile="OV";
+local $::keytype="rsa:4096";
+local $::httpagent = "tcsg5-apitool/0.02 (DLG Nikhef NL v20241224)";
+local $::verb = 0;
+local $::dry = 0;
+my $friendlyname;
+my $jsonfile;
+my $jsonfiledate=0;
+my $jsondata;
+my $help;
+
+# read local dot-config if present before cmd arguments (update defaults)
+foreach my $cfgfile (
+    "$ENV{'HOME'}/.tcsg5apirc", "$ENV{'HOME'}/.haricarc",
+    "/usr/local/etc/tcsg5apirc", "/usr/local/etc/haricarc",
+    "/etc/tcsg5apirc", "/etc/haricarc"
+    ) {
+    if ( -r $cfgfile ) {
+        open CFG,"<$cfgfile" or die "Cannot open config $cfgfile: $!\n";
+        my $config = do { local $/; <CFG> };
+        close CFG;
+        $SIG{'__WARN__'} = sub { }; eval($config); $SIG{'__WARN__'} = 'DEFAULT';
+        die "Invalid statement in config $cfgfile $@\n" if $@;
+        last;
+    }
+}
+
+&GetOptions(
+  's|jsonsource=s' => \$::tokensecjsonpat,
+  't|tokenname=s' => \$::tokenname,
+  'e|endpoint=s' => \$::cm_endpoint,
+  'P|passwordfile=s' => \$::cmpasswordfile,
+  'U|username=s' => \$::cmusername,
+  'O|orgname|organizationName=s' => \$::orgname,
+  'R|req|csr=s' => \$::csrfile,
+  'certprofile=s' => \$::profile,
+  'F|name=s' => \$friendlyname,
+  'h|help' => \$help,
+  'n|dryrun|dry' => \$::dry,
+  'v|verbose+' => \$::verb
+) or exit 1;
+
+if ( $help or $#ARGV < -1 ) { 
+  print &get_usage_text($0);
+  exit;
+}
+
+# ###########################################################################
+# initialise context and retrieve ephemeral connection data
+#
+my ($cm_domain,$cookie_jar,$ua,$res);
+( $cm_domain = $::cm_endpoint ) =~ s/^https?:\/\///;
+$cookie_jar = HTTP::Cookies->new( ignore_discard => 1 );
+$ua = LWP::UserAgent->new( cookie_jar => $cookie_jar );
+
+push @{ $ua->requests_redirectable }, 'POST';
+$ua->agent($::httpagent);
+$ua->timeout(60);
+$ua->default_header('Accept' => "application/json, text/plain, */*");
+$::verb >= 4 and $ua->add_handler( 
+    request_send => sub { 
+        my($request, $ua, $handler) = @_; 
+        print "REQUEST_SEND:\n".Dumper($request); 
+        return undef; 
+    } );
+
+print "Connecting to HARICA API endpoint on $cm_domain\n";
+
+# ###########################################################################
+# Login 2FA (Enterprise Admin needs 2FA)
+#
+# obtain RequestVerificationToken from the home page, perform 2FA login
+# and then re-obtain the token (since apparently we have to do it twice
+# and a successful login re-sets the RequestVerificationToken?)
+
+my $webtoken;
+
+&ua_update_rvtoken($ua) or die "Cannot update required RVtoken\n";
+
+my %logindata = (
+    "email"         => $::cmusername,
+    "password"      => &password_get(),
+    "token"         => &totp_get_token($::tokensecjsonpat,$::tokenname)
+    );
+
+$ua->default_header('Content-Type' => "application/json;charset=utf-8");
+$res = &ua_call($ua,"post","/api/User/Login2FA", 
+        Content => encode_json(\%logindata) 
+    );
+if ( $res->decoded_content =~ 
+    /^[a-z0-9][-a-z0-9=\/]+\.[-a-z0-9=\/]+\.[-a-z0-9=\/_]+$/i ) { # got a JWT
+    # strip off any line endings not part of the JWT
+    ($webtoken=$res->decoded_content) =~ s/[\r\n]*$//;
+    $::verb and print "Authorization JWT: $webtoken\n";
+    $ua->default_header('Authorization' => "$webtoken");
+} else {
+    die "This response to the Login2FA was not expected (I wanted a JWT).\n";
+}
+
+&ua_update_rvtoken($ua) or die "Cannot update required RVtoken\n";
+
+#
+# Have a JWT hereafter. But remember the JWT is not enough. Like the world...
+# ###########################################################################
+
+if ( $#ARGV < 0 ) { # no request to be done now
+    print "Login succeeded, but no command given\n";
+    print "Valid commands:\n";
+    print "  req <domain> [<domain> ...]   (requires CSR file or AUTO)\n";
+    print "  dl <uuid>\n";
+    print "  orglist <domain> [<domain> ...]\n";
+    exit 0;
+}
+
+my $command = shift;
+
+# ###########################################################################
+# REQUEST function - write to the usual local directory structure
+#
+if ( $command eq "req" ) {
+    die "No domains specified\n" unless $#ARGV>=0;
+
+    my @domains = @ARGV;
+    my $org = undef;
+    my ($fname, $dirname, $csr, $modulus);
+
+    # retrieve the matching organisation, including the DN components
+    # there can be multiple matching orgs, use -O to disambiguate
+    #
+    $ua->default_header('Content-Type' => "application/json;charset=utf-8");
+    $res = &ua_call($ua,"post",
+        "/api/ServerCertificate/CheckMachingOrganization", 
+        Content => "[".&harica_req_build_domstring(@domains)."]"
+    );
+    die &uares_check_content($res) ."\n" if &uares_check_content($res);
+
+    my @orglist = @{decode_json($res->decoded_content)};
+    die "No available organisation for this domainlist\n" if $#orglist < 0;
+
+    if ( $#orglist > 0 ) {
+        die "Multiple orgs possible but no selection made (use -O org)\n"
+            unless $::orgname;
+
+        foreach my $try_org ( @orglist ) {
+            if ( $try_org->{'organizationName'} eq $::orgname ) {
+                $org = $try_org;
+                last;
+            }
+        }
+
+        die "Organisation $::orgname is not valid for this domainset\n"
+            if not defined $org;
+    } else {
+        $org = $orglist[0];
+    }
+
+    print "Requesting certificate in ".
+        $org->{'organizationName'}." (".$org->{'id'}.")\n";
+
+    # construct a friendly name for the cert based on first domain name
+    # or override with a commandline argument (-F)
+    $fname = $ARGV[0];
+    $fname = $friendlyname if defined $friendlyname;
+
+    $dirname = &mk_certdir($fname,"key-$fname.pem","request-$fname.pem");
+
+    $csr=""; $modulus="unknown";
+    if ( $::csrfile eq "AUTO" or $::csrfile eq "auto" ) {
+
+        system("openssl req -new -nodes -newkey $::keytype -outform pem".
+            " -out \"$dirname/request-$fname.pem\" -keyout \"$dirname/key-$fname.pem\"".
+            " -subj \"/CN=$fname\"");
+        die "Did not find the generated request for $fname in $dirname\n" unless ( -s "$dirname/request-$fname.pem" );
+        system("openssl req -in \"$dirname/request-$fname.pem\" -text -out \"$dirname/request-$fname.txt\"");
+
+        open my $fh, '<', "$dirname/request-$fname.pem" or die "Can't open file $dirname/request-$fname.pem: $!\n";
+        $csr = do { local $/; <$fh> };
+        close $fh;
+
+        $modulus = `openssl req -noout -modulus -in \"$dirname/request-$fname.pem\"`;
+        $modulus =~ s/^.*=\s*//;
+        die "Generated CSR is not valid (no modulus)\n" unless $modulus =~ /^[0-9A-F]+$/i;
+
+    } else {
+
+        die "Request needs a CSR file, but $::csrfile cannot be read\n" unless -r $::csrfile;
+
+        open my $fh, '<', "$::csrfile" or die "Can't open file $::csrfile $!\n";
+        $csr = do { local $/; <$fh> };
+        close $fh;
+
+    }
+
+    my %formdata;
+    %formdata = &harica_req_build($org,$::profile,$csr,$fname,@domains);
+
+    print "Requesting certificate for @domains using $::csrfile\n";
+
+
+    if ( ! $::dry ) {
+        $ua->default_header('Content-Type' => "multipart/form-data;charset=utf-8");
+        $res = &ua_call($ua,"post","/api/ServerCertificate/RequestServerCertificate", Content_Type => 'form-data', Content => \%formdata );
+        die "No valid response for requesting server certificate\n" unless $res;
+        die "Error requesting server certificate\n" unless $res->is_success;
+        if ( $res->code != 200 ) {
+            print "Error in placing server certificate request: ".$res->code."\n";
+            ( my $msg = $res->decoded_content ) =~ s/^/    /gim;
+            print "$msg\n";
+            exit(1);
+        } 
+        print "Requested certificate. Response is:\n";
+        print "  ".$res->decoded_content."\n";
+        my %responsejson = %{decode_json($res->decoded_content)};
+
+        # write meta-data in the per-certificate request directory
+        my $fh;
+        open $fh,">$dirname/id-$fname.pem" and do {
+            print $fh "friendlyName $fname\nid ".$responsejson{'id'}."\n";
+            print $fh "modulus $modulus\n";
+            print $fh "requested ".strftime("%Y-%m-%dT%H:%M:%SZ",gmtime())."\n";
+            print $fh "domains @domains\n";
+            close $fh;
+        };
+
+    } else {
+        print "DRYRUN: POST /api/ServerCertificate/RequestServerCertificate with form-data\n";
+        ( my $dump = Dumper(%formdata) ) =~ s/^/DRYRUN:  /gim;
+        print $dump;
+    }
+
+} 
+
+# ###########################################################################
+# DOWNLOAD/RETRIEVE function - write to the usual local directory structure
+# potentially prepared by the REQUEST command
+# note this one needs order numbers but these can be retrieved from the 
+# directory - by hand for now
+#
+elsif ( $command eq "get" or $command eq "dl" ) {
+    die "No order identifiers specified\n" unless $#ARGV>=0;
+
+    foreach my $id ( @ARGV ) {
+        warn "$id: not a valid UUID, ignored\n" and next unless $id =~ /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+        $ua->default_header('Content-Type' => "application/json;charset=utf-8");
+        $res = &ua_call($ua,"post",
+            "/api/Certificate/GetCertificate",
+            Content => "{ \"id\": \"$id\" }"
+            );
+        die &uares_check_content($res) ." for certificate $id\n" if &uares_check_content($res);
+
+        if ( $res->code != 200 ) {
+            print "Error in retrieving certificate $id: ".$res->code."\n";
+            ( my $msg = $res->decoded_content ) =~ s/^/    /gim;
+            print "$msg\n";
+            next;
+        } 
+
+
+        print "Certificate order id $id\n";
+        my %certdata = %{decode_json($res->decoded_content)};
+        my $fname = $certdata{'friendlyName'};
+        $fname = $friendlyname if defined $friendlyname;
+
+        my $dirname = &mk_certdir($fname);
+
+        print "Writing certificate data for $fname to $dirname\n";
+
+        my $fh;
+
+        open $fh,">$dirname/meta-$fname.pem" and do {
+            print $fh "friendlyName $fname\nid $id\n";
+            print $fh "retrieved ".strftime("%Y-%m-%dT%H:%M:%SZ",gmtime())."\n";
+            close $fh;
+        };
+        open $fh,">$dirname/cert-$fname.pem" and do {
+            print $fh $certdata{'certificate'};
+            close $fh;
+        };
+        open $fh,">$dirname/bundle-$fname.pem" and do {
+            print $fh $certdata{'pemBundle'};
+            close $fh;
+        };
+
+        # split up the pemBundle into individual certs
+        my (@certs,@blines);
+        @blines = split /\n/,$certdata{'pemBundle'};
+        while ( $_ = shift @blines ) {
+            $_ eq "-----BEGIN CERTIFICATE-----" and do {
+                my $pemblob="$_\n";
+                while ( ( $_ = shift @blines ) ne "-----END CERTIFICATE-----" ) {
+                    $pemblob .= "$_\n";
+                }
+                $pemblob .= "-----END CERTIFICATE-----\n";
+                push @certs,$pemblob;
+            };
+        }
+
+        open $fh,">$dirname/chain-$fname.pem" and do {
+            for ( my $i = 1; $i < $#certs ; $i++ ) {
+                print $fh $certs[$i];
+            }
+            close $fh;
+        };
+
+        open $fh,">$dirname/nginx-$fname.pem" and do {
+            for ( my $i = 0; $i < $#certs ; $i++ ) {
+                print $fh $certs[$i];
+            }
+            close $fh;
+        };
+
+    }
+}
+
+# ###########################################################################
+# LIST organisations that can be selected for this domainset
+#
+elsif ( $command eq "orglist" ) {
+    die "No domain given, at least one needed for orglist\n" unless $#ARGV>=0;
+    # retrieve the matching organisation, including the DN components
+    $ua->default_header('Content-Type' => "application/json;charset=utf-8");
+    $res = &ua_call($ua,"post",
+        "/api/ServerCertificate/CheckMachingOrganization", 
+        Content => "[".&harica_req_build_domstring(@ARGV)."]"
+    );
+
+    die &uares_check_content($res) ." for matching org\n" 
+        if &uares_check_content($res);
+
+    my @orglist = @{decode_json($res->decoded_content)};
+    die "No available organisation for this domainlist\n" if $#orglist < 0;
+
+    print "".(1+$#orglist)." available organisations for the combined domains:\n";
+    foreach my $org ( @orglist ) {
+        printf "- %-37s %s\n",$org->{'organizationName'},$org->{'id'};
+        printf "  %s\n",$org->{'dn'};
+    }
+    print "Note that not all domains may be available for direct issuance\n";
+
+
+} else {
+    die "Unkown command $command, sorry!\n";
+}
+
+#
+# End of tools - support routines follow (only)
+#
+# ###########################################################################
+
+# ###########################################################################
+# request construction
+#
+sub harica_req_build() {
+    my ($org_dataref,$profile,$csr,$name,@domains) = @_;
+
+    return undef unless $profile =~ /^[A-Z]+$/;
+    return undef unless $org_dataref and $csr;
+    return undef unless $#domains >= 0;
+    $name = $domains[0] unless $name;
+
+    my $orgID = $org_dataref->{'id'};
+    my $orgDN = "OrganizationId:$orgID";
+
+    # we MUST construct the whole DN, or the request will enter a manual 
+    # validation queue
+
+    $orgDN .= "&C:".$org_dataref->{'country'} if $org_dataref->{'country'};
+    $orgDN .= "&ST:".$org_dataref->{'state'} if $org_dataref->{'state'};
+    $orgDN .= "&L:".$org_dataref->{'locality'} if $org_dataref->{'locality'};
+    $orgDN .= "&O:".$org_dataref->{'organizationName'} if $org_dataref->{'organizationName'};
+    $orgDN .= "&OU:".$org_dataref->{'organizationUnitName'} if $org_dataref->{'organizationUnitName'};
+
+    my %formdata = (
+        "organizationDN" => $orgDN,
+        "consentSameKey" => "false",
+        "isManualCSR" => "true",
+        "transactionType" => $::profile,
+        "duration" => 1,
+        "csr" => $csr,
+        "friendlyName" => $name,
+    );
+
+    my $domstring = &harica_req_build_domstring(@domains);
+
+    $formdata{'domains'} = "[$domstring]";
+    $formdata{'domainsString'} = "[$domstring]";
+
+    return %formdata;
+}
+
+#
+# the json for the domain request is rather bespoke, but at least
+# the same for the MachingOrganization API call and the request itself,
+# so we can re-use the construction routine
+#
+sub harica_req_build_domstring() {
+    my (@domains) = @_;
+
+    my @requested_domains = ();
+    my $domstring = '';
+    foreach my $dom ( @domains ) {
+        next if grep /^$dom$/,@requested_domains;
+        $domstring .= "," if $domstring;
+        $domstring .= '{';
+        if ( $dom =~ /.*\*.*/ ) {
+            $domstring .= "\"isWildcard\":true";
+        } else {
+            $domstring .= "\"isWildcard\":false";
+        }
+        if ( $dom =~ /^www\.(.*$)$/ ) {
+            push @requested_domains,$1;
+            $domstring .= ",\"domain\":\"$1\"";
+            $domstring .= ",\"includeWWW\":true";
+        } else {
+            push @requested_domains,$dom;
+            $domstring .= ",\"domain\":\"$dom\"";
+            $domstring .= ",\"includeWWW\":false";
+        }
+        $domstring .= '}';
+    }
+
+    return $domstring;
+}
+
+sub mk_certdir() {
+    my ($fname,@keyfiles) = @_;
+
+    # renormalise friendly name to match useful filenames
+    $fname =~ s/[^-a-zA-Z0-9_\.]/_/g;
+
+    my $dirname = "tcs-$fname";
+
+    if ( -d $dirname ) {
+        # should we backup and create because key files are present?
+        #
+        my $shouldmove = 0;
+        foreach my $testglob ( @keyfiles ) {
+            $shouldmove = 1 if glob("$dirname/$testglob");
+        }
+
+        if ( $shouldmove ) {
+            my $oldtime = strftime("%Y-%m-%d.%H.%M.%S",localtime((stat($dirname))[9]));
+            print "Evacuating $dirname to $dirname--$oldtime\n";
+            rename $dirname, "$dirname--$oldtime" or 
+                die "Cannot save old directory $dirname: $!\n"
+                unless $::dry;
+        }
+    }
+
+    if ( ! $::dry ) {
+        mkdir $dirname,0750;
+        die "Could not create $dirname (not a directory)\n" unless -d $dirname;
+    } else {
+        $dirname = ".";
+    }
+    $::verb > 1 and print "Certificate directory is $dirname\n";
+    return $dirname;
+}
+
+# ###########################################################################
+# display a UA web call result
+# 
+
+sub ua_call() {
+    my ($ua,$call,$endpoint,%data) = @_;
+
+    my $res;
+
+    die "Cannot find LWP UA\n" unless $ua;
+    die "Invalid call (no call specificied)\n" unless $call;
+
+    if ( $call =~ /^post$/i ) {
+        if ( $::verb > 1 ) { 
+            print "LWP POST $::cm_endpoint$endpoint";
+            $data{'Content'} and do print " with $data{'Content'}";
+            print "\n";
+        }
+        $res = $ua->post("$::cm_endpoint$endpoint", %data );
+    } elsif ( $call =~ /^get$/i ) {
+        if ( $::verb > 1 ) { 
+            print "LWP GET $::cm_endpoint$endpoint";
+        }
+        $res = $ua->get("$::cm_endpoint$endpoint");
+    } else {
+        die "Invalid call $call\n";
+    }
+
+    if ( $::verb > 1 ) {
+        &uares_display($res);
+    }
+    return $res;
+}
+
+sub uares_display() {
+    my ($res) = @_;
+
+    if ( $res->is_success) {
+        if ( $::verb > 1 ) {
+            printf "----- %-38s ---------------------------------\n",$res->status_line;
+            #print $res->headers_as_string();
+            #print "-----------------------------------------------------------------------------\n";
+            my $lines=0;
+            foreach ( split /\n/,$res->decoded_content ) {
+                print "  $_\n";
+                last if ( $lines++ > 9 );
+            }
+            print "  ...\n";
+            print "-----------------------------------------------------------------------------\n";
+        }
+        my $indexcontent=$res->decoded_content;
+        if ( $indexcontent =~ /__RequestVerificationToken\"[^>]*value=\"([^\"]+)\"/ ) {
+          print "NOTE: found RVToken $1\n";
+        }
+        return 1;
+    } else {
+        print "!! Something, somewhere went wrong:\n";
+        print "  ".$res->status_line."\n";
+        return 0;
+    }
+}
+
+sub uares_check_content() {
+    my ($res) = @_;
+
+    return "No valid response (invocation error)" unless $res;
+    return "Error in call invocation (no success)" unless $res->is_success;
+    return "Error in call result (no content)" unless $res->decoded_content;
+    return undef;
+}
+
+sub ua_update_rvtoken() {
+    my ($uaref) = @_;
+    my ($RVresponse);
+
+    my $idxres = $uaref->get( "$::cm_endpoint" );
+    my $indexcontent=$idxres->decoded_content;
+    if ( $indexcontent !~ /__RequestVerificationToken\"[^>]*value=\"([^\"]+)\"/ ) {
+      print STDERR "Cannot get RequestVerificationToken from the web page\n";
+      return undef;
+    }
+    $RVresponse = $1;
+    $::verb and print "Updated RVToken from GET $::cm_endpoint to $RVresponse\n";
+    $uaref->default_header('RequestVerificationToken' => "$RVresponse");
+    return $RVresponse;
+}
+
+# ##########################################################################
+#
+#
+
+sub password_get() {
+    
+    my $passwd="";
+
+    if ( -r $::cmpasswordfile ) {
+        # retrieve account password from password file
+        open my $fh, '<', "$::cmpasswordfile" or die "Can't open file $::cmpasswordfile: $!\n";
+        $passwd = do { local $/; <$fh> };
+        close $fh;
+    } else {
+        $|=1;
+        print "Your password for $::cmusername: "; 
+        ReadMode ( 'noecho' );
+        $passwd = <STDIN>;
+        ReadMode ( 'normal' );
+        print "\n";
+    }
+    chomp($passwd);
+
+    die "Cannot retrieve password for API user from $::cmpasswordfile\n" unless $passwd;
+    $::verb and print "Retrieved password from $::cmpasswordfile\n";
+
+    return $passwd;
+}
+
+sub totp_get_token() {
+    my ($tokensecjsonpat,$tokenname) = @_;
+    my $otptoken=undef;
+
+    # get the OTP token secrets file from a glob pattern
+    # (before getting the RequestVerificationToken since that is very slow)
+    foreach my $f ( glob($tokensecjsonpat) ) {
+      if ( (stat($f))[9] > $jsonfiledate ) {
+        $jsonfiledate = (stat(_))[9];
+        $jsonfile = $f;
+      }
+    }
+    if ( ! $jsonfile or ! -f $jsonfile ) {
+        $|=1;
+        while ( not defined $otptoken or $otptoken !~ /^[0-9]{6}$/ ) {
+            print "Your TOTP response for $::cmusername ($tokenname): "; 
+            $otptoken = <STDIN>;
+        }
+        return $otptoken;
+    }
+    die "Cannot find totp secrets in $tokensecjsonpat (no such file)\n" unless $jsonfile;
+
+    # generate OTP token from the AndOTP JSON secrets file
+    # do this after the slow RV token retrieval
+    #  print "Generating TOTP tokens based on $jsonfile\n";
+    #  my $timeleft = 30-(time()%30);
+    #  my $timeend = strftime("%H:%M:%S",localtime(time()+30-time()%30));
+    #  print "  valid for another $timeleft seconds (till $timeend)\n";
+    { local(*INPUT, $/); open (INPUT, $jsonfile) || die "can't open $jsonfile: $!"; $jsondata = <INPUT>; }
+    my $jsonref = decode_json $jsondata;
+    
+    #
+    # retrieve OTP token from the secret file (in AndOTP formatted JSON)
+    foreach my $entry ( @$jsonref ) {
+      next unless $entry->{"type"} eq "TOTP";
+      next unless defined $entry->{"secret"};
+      next unless $entry->{"issuer"} eq $tokenname;
+    
+      if ( (defined ($entry->{"issuer"}) and $entry->{"issuer"} =~ /$tokenname/i) or 
+           (defined ($entry->{"label"})  and $entry->{"label"}  =~ /$tokenname/i) ) {
+            $otptoken = &totp_token($entry->{"secret"});
+            last;
+      }
+    }
+
+    die "Cannot find TOTP secret for $tokenname in $jsonfile, bailing.\n" unless $otptoken;
+
+    $::verb and print "Current TOTP value for $tokenname is $otptoken\n";
+
+    return $otptoken;
+}
+
+sub totp_token {
+    my $secret = shift;
+
+    $secret =~ s/====$//; # some base32 encodings have superfluous padding
+
+    my $key = unpack("H*", decode_base32($secret));
+    my $lpad_time = sprintf("%016x", int(time()/30));
+    my $hmac = hmac_sha1_hex_string($lpad_time, $key);
+
+    my $offset = sprintf("%d", hex(substr($hmac, -1)));
+
+    my $part1 = 0 + sprintf("%d", hex(substr($hmac, $offset*2, 8)));
+    my $part2 = 0 + sprintf("%d", hex("7fffffff"));
+
+    my $token = substr("".($part1 & $part2), -6);
+    return $token;
+}
+
+sub  hmac_sha1_hex_string {
+   my ($data, $key) = map pack('H*', $_), @_;
+   hmac_sha1_hex($data, $key);
+}
+
+
+# ###########################################################################
+# 
+#
+sub get_usage_text() {
+  my ($progname) = @_;
+
+  $progname =~ s/.*\///;
+
+  return <<EOF;
+tcsg5-apitool - HARICA API for TCS Gen5 commissioning
+
+Usage: $progname [-s andOTPfile.json] [-e endpoint] [-t tokenname]
+    [-P passwordfile] [-U user_email] [-R csrfile_pem] [-h] [-n] [-v[v]]
+    [-O orgname] [--profile (OV|EV|DV)] [-F friendlyname]
+    <COMMAND> <commandargs> ...
+
+    -e url          HARICA API endpoint ($::cm_endpoint)
+    -U email        email address of the user in the portal
+    -R file         file with a PEM formatted CSR (only key is used)
+                    (the default is AUTO, which creates a fresh $::keytype
+                    request in a subdirectory names after the first
+                    domain name, i.e. cert's friendlyName)
+                    AUTO requests need `openssl` to be installed
+    -F name         name used for request and directory naming
+    -O orgname      organisation name to use for OV/EV issuance (required if
+                    more than one org matches the given domainlist)
+    --profile xv    Set cert profile to OV, EV, DV, ... (default $::profile)
+    -v[v...]        become (ver|very)bose
+    -h              this help
+    -n | --dryrun   do not actually do persistent actions changing state
+
+    -s file         JSON file containing the TOTP shared secrets
+        default TOTP secrets JSON is $::tokensecjsonpat
+        (can also be set using the ANDOTPJSON environment variable)
+    -t name         name of the TOTP token in the secrets file
+    -P file         password for the user is by default in 
+                      $::cmpasswordfile
+        (please make sure this is on an empheral encrypted filesystem)
+
+Commands
+--------
+req <domain> [<domain> ...]
+
+    submit a request with these domain names, and (if AUTO request)
+    store the result in a subdirectory named after the first domain
+    or friendly name ("./tcs-<domain>/").
+    Returns the ID of the request (a UUID). If set to auto, will
+    also put this in the "id-<domainname" meta-data file for reference
+
+    Example: $progname -R AUTO req sso.nikhef.nl
+
+dl <uuid>
+
+    download a validated and issued certificate for order <uuid>. This
+    <uuid> is shown after the request has been submitted, but can also
+    be retrieved from the HARICA CM portal and (if AUTO modus) from the
+    'id-' file in the subdirectory for the request
+
+    Example: $progname dl 59af3920-0994-4e80-b2cd-b39a81dac9e2
+
+orglist <domain> [<domain> ...]
+
+    list the organisations that can issue for the provided list of
+    domains (in combination with your own account privileges).
+
+    Example: $progname orglist nikhef.nl achtbaan.nationalespeeltuin.nl
+
+there are no other valid commands (yet). To approve requests by the
+second-pair-of-eyes, use the HARICA CM portal for now. In the future,
+this tool may have dual-user/approver support.
+Important: this tool ONLY works with PREVALIDATED domains.
+
+The utility uses the plain-text backup JSON format from andOTP to read
+the secrets, and the labels + issuers associated with these. This makes
+a perl-based alternative to having your totp device handy.
+File should have JSON syntax like: 
+  [ { "algorithm" : "SHA1", "digits" : 6, "period" : 30, "type" : "TOTP",
+      "issuer" : "token-name-here", "label" : "label-set-by-issuer",
+      "secret" : "VERYVERYSECRETDATAISHIDDENINHERE" } ]
+
+If the token secrets file or the password file cannot be opened, then
+the script will ask for a response on the terminal.  But be quick for the 
+TOTP token entry!
+
+The tool will parse (perl-syntax) rc files from ~/.tcsg5apirc or like 
+files (~/.haricarc, /etc/tcsg5apirc, /etc/haricarc, and /usr/local/etc/...)
+to overwrite some of the defaults on a per-user basis (like the password
+and totp secrets file)
+
+Example of a \$HOME/.haricarc file:
+
+    # @(#)tcsg5apirc
+    \$::cmusername = 'davidg\@nikhef.nl';
+    \$::tokensecjsonpat="/mnt/secured/otpbackup/otp_accounts_*.json";
+    \$::tokenname = "HARICA STG DAVIDG";
+    \$::cmpasswordfile = "/mnt/secured/HARICA-TCSG5/cm-stg.davidg.passphrase";
+    \$::cm_endpoint = "https://cm-stg.harica.gr";
+    \$::profile = "OV";
+    \$::orgname = "Nikhef ".
+        "(Stichting Nederlandse Wetenschappelijk Onderzoek Inst.)";
+
+This tool comes with no warranties whatsoever, and may cause your pet to
+walk out on you. Beware!
+EOF
+}
