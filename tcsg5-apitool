@@ -61,7 +61,6 @@ local $::httpagent = "tcsg5-apitool/0.02 (DLG Nikhef NL v20241224)";
 local $::openssl = "openssl";
 local $::verb = 0;
 local $::dry = 0;
-my $ossl_available=0;
 my $friendlyname;
 my $jsonfile;
 my $jsonfiledate=0;
@@ -107,7 +106,6 @@ if ( $help or $#ARGV < -1 ) {
 # ###########################################################################
 # initialise context and retrieve ephemeral connection data
 #
-$ossl_available = &openssl_isavailable($::openssl);
 
 my ($cm_domain,$cookie_jar,$ua,$res);
 ( $cm_domain = $::cm_endpoint ) =~ s/^https?:\/\///;
@@ -228,9 +226,6 @@ if ( $command eq "req" ) {
     $csr=""; $modulus="unknown";
     if ( $::csrfile eq "AUTO" or $::csrfile eq "auto" ) {
 
-        die "This mode needs OpenSSL available, but $::openssl not found\n"
-            unless $ossl_available;
-
         system("$::openssl req -new -nodes -newkey $::keytype -outform pem".
             " -out \"$dirname/request-$fname.pem\" -keyout \"$dirname/key-$fname.pem\"".
             " -subj \"/CN=$fname\"");
@@ -350,10 +345,10 @@ elsif ( $command eq "get" or $command eq "dl" ) {
             print $fh $certdata{'pKCS7'};
             close $fh;
         };
-        if ( $ossl_available ) {
-            system("openssl pkcs7 -in \"$dirname/bundle-$fname.p7c\" ".
-                "-outform der -out \"$dirname/bundle-$fname.p7b\"");
-        }
+        system("$::openssl pkcs7 -in \"$dirname/bundle-$fname.p7c\" ".
+            "-outform der -out \"$dirname/bundle-$fname.p7b\"");
+            # we do not care about the return status - if it fails,
+            # too bad, we still have the PEM blob
 
         # split up the pemBundle into individual certs
         my (@certs,@blines);
@@ -529,27 +524,6 @@ sub mk_certdir() {
     }
     $::verb > 1 and print "Certificate directory is $dirname\n";
     return $dirname;
-}
-
-sub openssl_isavailable() {
-    my ($ossl) = @_;
-
-    $ossl = $::openssl unless $ossl;
-
-    my $ossl_available = 0;
-    my ($osslh,$osslrc);
-    $osslrc = open $osslh,"-|", "$::openssl version 2>/dev/null";
-    if ( $osslrc ) {
-        my $ossl_version = <$osslh>;
-        close $osslh;
-        if ( defined $ossl_version )  {
-            chomp($ossl_version);
-            $ossl_version =~ s/^OpenSSL\s+(\S+)\s+.*$/$1/igm;
-            $::verb >= 2 and print "Openssl version $ossl_version available as $::openssl\n";
-            $ossl_available = 1;
-        }
-    }
-    return $ossl_available;
 }
 
 # ###########################################################################
