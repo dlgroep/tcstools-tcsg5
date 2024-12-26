@@ -57,8 +57,12 @@ local $::orgname = undef;
 local $::csrfile="AUTO";
 local $::profile="OV";
 local $::keytype="rsa:4096";
-local $::httpagent = "tcsg5-apitool/0.02 (DLG Nikhef NL v20241224)";
+local $::httpagent = "tcsg5-apitool/0.03 (DLG Nikhef NL v20241225)";
 local $::openssl = "openssl";
+local $::ossl_packaging = 0;
+local $::ossl_pkcs12_extra_opts = "";
+local $::basedir = ".";
+local $::dirprefix = "tcs-";
 local $::verb = 0;
 local $::dry = 0;
 my $friendlyname;
@@ -92,7 +96,10 @@ foreach my $cfgfile (
   'O|orgname|organizationName=s' => \$::orgname,
   'R|req|csr=s' => \$::csrfile,
   'certprofile=s' => \$::profile,
+  'd|basedir=s' => \$::basedir,
   'F|name=s' => \$friendlyname,
+  'A|advanced_packaging' => \$::ossl_packaging,
+  'pkcs12_opts=s' => \$::ossl_pkcs12_extra_opts,
   'h|help' => \$help,
   'n|dryrun|dry' => \$::dry,
   'v|verbose+' => \$::verb
@@ -333,6 +340,7 @@ elsif ( $command eq "get" or $command eq "dl" ) {
             print $fh "retrieved ".strftime("%Y-%m-%dT%H:%M:%SZ",gmtime())."\n";
             close $fh;
         };
+
         open $fh,">$dirname/cert-$fname.pem" and do {
             print $fh $certdata{'certificate'};
             close $fh;
@@ -345,15 +353,15 @@ elsif ( $command eq "get" or $command eq "dl" ) {
             print $fh $certdata{'pKCS7'};
             close $fh;
         };
-        system("$::openssl pkcs7 -in \"$dirname/bundle-$fname.p7c\" ".
-            "-outform der -out \"$dirname/bundle-$fname.p7b\"");
-            # we do not care about the return status - if it fails,
-            # too bad, we still have the PEM blob
 
         # split up the pemBundle into individual certs
-        my (@certs,@blines);
+        # in HARICA pemBundle format, each blob is PREceeded by a subject=
+        # and issuer= line with the RFC2253 DN of each following blob
+        my (@certs,@blines,@cert_subject,@cert_issuer,$iSub,$iIss);
         @blines = split /\n/,$certdata{'pemBundle'};
         while ( $_ = shift @blines ) {
+            $_ =~ /^subject\s*=\s*(.*)$/ and $iSub=$1;
+            $_ =~ /^issuer\s*=\s*(.*)$/ and $iIss=$1;
             $_ eq "-----BEGIN CERTIFICATE-----" and do {
                 my $pemblob="$_\n";
                 while ( ( $_ = shift @blines ) ne "-----END CERTIFICATE-----" ) {
@@ -361,22 +369,46 @@ elsif ( $command eq "get" or $command eq "dl" ) {
                 }
                 $pemblob .= "-----END CERTIFICATE-----\n";
                 push @certs,$pemblob;
+                push @cert_subject,$iSub;
+                push @cert_issuer,$iIss;
             };
         }
 
+        # chain is the (ordered) list we get from HARICA. Assume that
+        # this does not include the self-signed root, as we know HARICA
+        # to be a clueful provider, but it may include a legacy trust path.
+        # AND: nobody dare to insert a comma in an organisation name!
         open $fh,">$dirname/chain-$fname.pem" and do {
-            for ( my $i = 1; $i < $#certs ; $i++ ) {
+            for ( my $i = 1; $i <= $#certs ; $i++ ) {
+                next if $cert_subject[$i] eq $cert_issuer[$i];
+                next if $cert_subject[$i] eq join ",", reverse split /,/,$certdata{'dN'};
                 print $fh $certs[$i];
             }
             close $fh;
         };
 
         open $fh,">$dirname/nginx-$fname.pem" and do {
-            for ( my $i = 0; $i < $#certs ; $i++ ) {
+            for ( my $i = 0; $i <= $#certs ; $i++ ) {
                 print $fh $certs[$i];
+                print $fh $certs[$i] unless $cert_subject[$i] eq $cert_issuer[$i];
             }
             close $fh;
         };
+
+        if ( $::ossl_packaging ) { # create advanced derived formats
+            system("$::openssl pkcs7 -in \"$dirname/bundle-$fname.p7c\" ".
+                "-outform der -out \"$dirname/bundle-$fname.p7b\"");
+            -r "$dirname/key-$fname.pem" and do { # create pkcs12 file
+                my $p12name = "$fname-".strftime("%Y%m%d-%H%M%S",localtime());
+                system("$::openssl pkcs12 -export $::ossl_pkcs12_extra_opts ".
+                    " -in \"$dirname/cert-$fname.pem\" ".
+                    " -inkey \"$dirname/key-$fname.pem\" ".
+                    " -certfile \"$dirname/bundle-$fname.pem\" ".
+                    " -name \"$p12name\" ".
+                    " -out \"$dirname/package-$fname.p12\" ".
+                    "  ");
+            };
+        }
 
     }
 }
@@ -497,7 +529,7 @@ sub mk_certdir() {
     # renormalise friendly name to match useful filenames
     $fname =~ s/[^-a-zA-Z0-9_\.]/_/g;
 
-    my $dirname = "tcs-$fname";
+    my $dirname = "$::basedir/$::dirprefix$fname";
 
     if ( -d $dirname ) {
         # should we backup and create because key files are present?
@@ -737,7 +769,6 @@ Usage: $progname [-s andOTPfile.json] [-e endpoint] [-t tokenname]
     [-O orgname] [--profile (OV|EV|DV)] [-F friendlyname]
     <COMMAND> <commandargs> ...
 
-    -e url          HARICA API endpoint ($::cm_endpoint)
     -U email        email address of the user in the portal
     -R file         file with a PEM formatted CSR (only key is used)
                     (the default is AUTO, which creates a fresh $::keytype
@@ -748,6 +779,11 @@ Usage: $progname [-s andOTPfile.json] [-e endpoint] [-t tokenname]
     -O orgname      organisation name to use for OV/EV issuance (required if
                     more than one org matches the given domainlist)
     --profile xv    Set cert profile to OV, EV, DV, ... (default $::profile)
+    -d dir          base directory for per-certificate/request directories
+    -A              create advanced formats on download (requires openssl)
+    -pkcs12_opts op add <op> as extra options to the openssl pkcs12 -export
+                    command line (e.g. "-passout pass:plain")
+    -e url          HARICA API endpoint ($::cm_endpoint)
     -v[v...]        become (ver|very)bose
     -h              this help
     -n | --dryrun   do not actually do persistent actions changing state
@@ -766,7 +802,7 @@ req <domain> [<domain> ...]
 
     submit a request with these domain names, and (if AUTO request)
     store the result in a subdirectory named after the first domain
-    or friendly name ("./tcs-<domain>/").
+    or friendly name ("$::basedir/$::dirprefix<domain>/").
     Returns the ID of the request (a UUID). If set to auto, will
     also put this in the "id-<domainname" meta-data file for reference
 
@@ -819,10 +855,26 @@ Example of a \$HOME/.haricarc file:
     \$::cmpasswordfile = "/mnt/secured/HARICA-TCSG5/cm-stg.davidg.passphrase";
     \$::cm_endpoint = "https://cm-stg.harica.gr";
     \$::profile = "OV";
+    \$::basedir = ".";
+    \$::ossl_pkcs12_extra_opts = "-passout pass:";
     \$::orgname = "Nikhef ".
         "(Stichting Nederlandse Wetenschappelijk Onderzoek Inst.)";
 
+KNOWN LIMITATIONS
+-----------------
+- No name component should contain a comma (","). If there are commas, then 
+  auto-EE detection will not work. That's usually harmless, but just in case.
+- For AUTO requests, and for advanced output formats (P7B DER, PKCS12) you
+  will need OpenSSL 1+ installed. Also on Windows. Use WSL, Cygwin, or a 
+  Win32 build of OpenSSL.
+- The Digest::HMAC_SHA1 and MIME::Base32 modules are only needed to generate
+  the totp token. If you do not like that, or do not have them, comment them
+  out and start frantically typing digits from your totp app.
+
+CAVEATS
+-------
 This tool comes with no warranties whatsoever, and may cause your pet to
 walk out on you. Beware!
+
 EOF
 }

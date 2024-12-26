@@ -5,7 +5,6 @@ Usage: tcsg5-apitool [-s andOTPfile.json] [-e endpoint] [-t tokenname]
     [-O orgname] [--profile (OV|EV|DV)] [-F friendlyname]
     <COMMAND> <commandargs> ...
 
-    -e url          HARICA API endpoint (https://cm-stg.harica.gr)
     -U email        email address of the user in the portal
     -R file         file with a PEM formatted CSR (only key is used)
                     (the default is AUTO, which creates a fresh rsa:4096
@@ -16,6 +15,11 @@ Usage: tcsg5-apitool [-s andOTPfile.json] [-e endpoint] [-t tokenname]
     -O orgname      organisation name to use for OV/EV issuance (required if
                     more than one org matches the given domainlist)
     --profile xv    Set cert profile to OV, EV, DV, ... (default OV)
+    -d dir          base directory for per-certificate/request directories
+    -A              create advanced formats on download (requires openssl)
+    -pkcs12_opts op add <op> as extra options to the openssl pkcs12 -export
+                    command line (e.g. "-passout pass:plain")
+    -e url          HARICA API endpoint (https://cm-stg.harica.gr)
     -v[v...]        become (ver|very)bose
     -h              this help
     -n | --dryrun   do not actually do persistent actions changing state
@@ -87,8 +91,24 @@ Example of a $HOME/.haricarc file:
     $::cmpasswordfile = "/mnt/secured/HARICA-TCSG5/cm-stg.davidg.passphrase";
     $::cm_endpoint = "https://cm-stg.harica.gr";
     $::profile = "OV";
+    $::basedir = ".";
+    $::ossl_pkcs12_extra_opts = "-passout pass:";
     $::orgname = "Nikhef ".
         "(Stichting Nederlandse Wetenschappelijk Onderzoek Inst.)";
 
+KNOWN LIMITATIONS
+-----------------
+- No name component should contain a comma (","). If there are commas, then 
+  auto-EE detection will not work. That's usually harmless, but just in case.
+- For AUTO requests, and for advanced output formats (P7B DER, PKCS12) you
+  will need OpenSSL 1+ installed. Also on Windows. Use WSL, Cygwin, or a 
+  Win32 build of OpenSSL.
+- The Digest::HMAC_SHA1 and MIME::Base32 modules are only needed to generate
+  the totp token. If you do not like that, or do not have them, comment them
+  out and start frantically typing digits from your totp app.
+
+CAVEATS
+-------
 This tool comes with no warranties whatsoever, and may cause your pet to
 walk out on you. Beware!
+
