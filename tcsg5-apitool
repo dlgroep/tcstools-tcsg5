@@ -266,6 +266,7 @@ if ( $command eq "req" ) {
 
     if ( ! $::dry ) {
         $ua->default_header('Content-Type' => "multipart/form-data;charset=utf-8");
+        if ( $::verb > 2 ) { ( my $dump = Dumper(%formdata) ) =~ s/^/VERB3+:  /gim; print "Form posting:\n$dump"; }
         $res = &ua_call($ua,"post","/api/ServerCertificate/RequestServerCertificate", Content_Type => 'form-data', Content => \%formdata );
         die "No valid response for requesting server certificate\n" unless $res;
         die "Error requesting server certificate\n" unless $res->is_success;
@@ -461,25 +462,25 @@ sub harica_req_build() {
 
     my $orgID = $org_dataref->{'id'};
     my $orgDN = "OrganizationId:$orgID";
+    my %formdata = (
+        "friendlyName" => $name,
+        "transactionType" => $::profile,
+        "consentSameKey" => "false",
+        "isManualCSR" => "true",
+        "duration" => 1,
+        "csr" => $csr,
+    );
 
     # we MUST construct the whole DN, or the request will enter a manual 
     # validation queue
-
-    $orgDN .= "&C:".$org_dataref->{'country'} if $org_dataref->{'country'};
-    $orgDN .= "&ST:".$org_dataref->{'state'} if $org_dataref->{'state'};
-    $orgDN .= "&L:".$org_dataref->{'locality'} if $org_dataref->{'locality'};
-    $orgDN .= "&O:".$org_dataref->{'organizationName'} if $org_dataref->{'organizationName'};
-    $orgDN .= "&OU:".$org_dataref->{'organizationUnitName'} if $org_dataref->{'organizationUnitName'};
-
-    my %formdata = (
-        "organizationDN" => $orgDN,
-        "consentSameKey" => "false",
-        "isManualCSR" => "true",
-        "transactionType" => $::profile,
-        "duration" => 1,
-        "csr" => $csr,
-        "friendlyName" => $name,
-    );
+    if ( $::profile eq "OV" or $::profile eq "EV" ) {
+        $orgDN .= "&C:".$org_dataref->{'country'} if $org_dataref->{'country'};
+        $orgDN .= "&ST:".$org_dataref->{'state'} if $org_dataref->{'state'};
+        $orgDN .= "&L:".$org_dataref->{'locality'} if $org_dataref->{'locality'};
+        $orgDN .= "&O:".$org_dataref->{'organizationName'} if $org_dataref->{'organizationName'};
+        $orgDN .= "&OU:".$org_dataref->{'organizationUnitName'} if $org_dataref->{'organizationUnitName'};
+        $formdata{'organizationDN'} = $orgDN;
+    }
 
     my $domstring = &harica_req_build_domstring(@domains);
 
@@ -499,7 +500,10 @@ sub harica_req_build_domstring() {
 
     my @requested_domains = ();
     my $domstring = '';
+    my $dominfo = '';
     foreach my $dom ( @domains ) {
+        # if a www. is coming up in rest of list, then ignore here
+        next if grep /^www\.$dom$/,@domains;
         next if grep /^$dom$/,@requested_domains;
         $domstring .= "," if $domstring;
         $domstring .= '{';
@@ -512,13 +516,16 @@ sub harica_req_build_domstring() {
             push @requested_domains,$1;
             $domstring .= ",\"domain\":\"$1\"";
             $domstring .= ",\"includeWWW\":true";
+            $dominfo .= " $1 (+WWW)\n";
         } else {
             push @requested_domains,$dom;
             $domstring .= ",\"domain\":\"$dom\"";
             $domstring .= ",\"includeWWW\":false";
+            $dominfo .= " $dom\n";
         }
         $domstring .= '}';
     }
+    if ($::verb > 2 ) { print "Domain list:\n$dominfo\n"; }
 
     return $domstring;
 }
