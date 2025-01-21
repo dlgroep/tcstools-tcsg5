@@ -336,18 +336,18 @@ elsif ( $command eq "get" or $command eq "dl" ) {
 
         my $fh;
 
-        open $fh,">$dirname/meta-$fname.pem" and do {
+        open $fh,">$dirname/meta-$fname.txt" and do {
             print $fh "friendlyName $fname\nid $id\n";
             print $fh "retrieved ".strftime("%Y-%m-%dT%H:%M:%SZ",gmtime())."\n";
             close $fh;
         };
 
         open $fh,">$dirname/cert-$fname.pem" and do {
-            print $fh $certdata{'certificate'};
+            print $fh &pem64($certdata{'certificate'});
             close $fh;
         };
         open $fh,">$dirname/bundle-$fname.pem" and do {
-            print $fh $certdata{'pemBundle'};
+            print $fh &pem64($certdata{'pemBundle'});
             close $fh;
         };
         open $fh,">$dirname/bundle-$fname.p7c" and do {
@@ -383,15 +383,15 @@ elsif ( $command eq "get" or $command eq "dl" ) {
             for ( my $i = 1; $i <= $#certs ; $i++ ) {
                 next if $cert_subject[$i] eq $cert_issuer[$i];
                 next if $cert_subject[$i] eq join ",", reverse split /,/,$certdata{'dN'};
-                print $fh $certs[$i];
+                print $fh &pem64($certs[$i]);
             }
             close $fh;
         };
 
         open $fh,">$dirname/nginx-$fname.pem" and do {
             for ( my $i = 0; $i <= $#certs ; $i++ ) {
-                print $fh $certs[$i];
-                print $fh $certs[$i] unless $cert_subject[$i] eq $cert_issuer[$i];
+                print $fh &pem64($certs[$i]);
+                print $fh &pem64($certs[$i]) unless $cert_subject[$i] eq $cert_issuer[$i];
             }
             close $fh;
         };
@@ -563,6 +563,42 @@ sub mk_certdir() {
     }
     $::verb > 1 and print "Certificate directory is $dirname\n";
     return $dirname;
+}
+
+# pem64(multi-line-string) turns any base64 blobs inside a PEM 
+# wrapper to 64 characters to align with the PEM RFC
+sub pem64() {
+    my ($in) = @_;
+    my $out;
+
+    if ( $in =~ /.*-----.*/m ) { # this is a PEM blob
+        $out="";
+        my @inlines = split /[\n\r]/,$in;
+        my $current_line;
+        while ( $current_line = shift @inlines ) {
+            if ( $current_line =~ /^-----/
+                or $current_line !~ /^[A-Za-z0-9\+\/=]{2,}$/ ) {
+                $out .= $current_line."\n";
+            } else {
+                my $blob = $current_line."\n";
+                while ( $current_line = shift @inlines ) {
+                    ( $current_line =~ /^-----/ or
+                    $current_line !~ /^[A-Za-z0-9\+\/=]{2,}$/ ) and do {
+                        unshift @inlines,$current_line;
+                        last;
+                    };
+                    $blob .= $current_line."\n";
+                }
+                $blob =~ s/[\n\r]*//gm;
+                $blob =~ s/(.{1,64})/$1\n/g;
+                $out .= $blob;
+            }
+        }
+    } else { # just rewrap to 64 characters
+        ($out = $in) =~ s/[\n\r]*//gm;
+        $out =~ s/(.{1,64})/$1\n/g;
+    }
+    return $out;
 }
 
 # ###########################################################################
