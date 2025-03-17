@@ -2,9 +2,10 @@ tcsg5-apitool - HARICA API for TCS Gen5 commissioning
 
 Usage: tcsg5-apitool [-s andOTPfile.json] [-e endpoint] [-t tokenname]
     [-P passwordfile] [-U user_email] [-R csrfile_pem] [-h] [-n] [-v[v]]
-    [-O orgname] [--profile (OV|EV|DV)] [-F friendlyname]
+    [-O orgname] [--profile (OV|EV|DV)] [-G | --igtf] [-F friendlyname]
     <COMMAND> <commandargs> ...
 
+    -G (--igtf)     request joint-trust public and IGTF trust (OV required)
     -U email        email address of the user in the portal
     -R file         file with a PEM formatted CSR (only key is used)
                     (the default is AUTO, which creates a fresh rsa:4096
