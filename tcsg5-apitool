@@ -392,7 +392,6 @@ elsif ( $command eq "get" or $command eq "dl" ) {
 
         open $fh,">$dirname/nginx-$fname.pem" and do {
             for ( my $i = 0; $i <= $#certs ; $i++ ) {
-                print $fh &pem64($certs[$i]);
                 print $fh &pem64($certs[$i]) unless $cert_subject[$i] eq $cert_issuer[$i];
             }
             close $fh;
