@@ -1,0 +1,53 @@
+#! /bin/sh
+#
+#
+
+port=443
+file=""
+verb=0
+quiet=0
+starttls=""
+
+while :; do
+  case "$1" in
+  -p ) port="$2" ; shift 2 ;;
+  -v ) verb=1 ; shift ;;
+  -q | -s ) quiet=1 ; shift ;;
+  -TLS ) starttls=" -starttls $2" ; shift  2 ;;
+  -* ) echo "Unknown option $1" >&2 ; exit 1 ;;
+  * ) break;
+  esac
+done
+
+case "$#" in
+1 ) host="$1" ;;
+* ) echo "Usage: $0 [-p port] hostname-or-filename" >&2 ; exit 1 ;;
+esac
+
+if [ -f "$host" ]; then
+  # we are apparently a file, not a host
+  echo "File: $host"
+  if [ `grep -c 'PRIVATE KEY' "$host"` -ne 0 ]; then
+    # we are a private key, print the modulus
+    echo -ne "Private key "
+    openssl rsa -modulus -noout -in "$host" | perl -pe 's/^Modulus=(.{2})(.{2})(.{2})(.{2})(.{2})(.{2})(.{2})(.{2})(.{2})(.{2})(.{2}).*$/Modulus: $1:$2:$3:$4:$5:$6:$7:$8:$9 .../'
+    exit 0
+  elif [ `grep -c 'CERTIFICATE REQUEST' "$host"` -ne 0 ]; then
+    osslcmd=req
+  else osslcmd=x509
+  fi
+  openssl $osslcmd -text -modulus -noout -in "$host" | egrep '(Subject:|Issuer:|Not Before|Not After|DNS|Modulus=)' | sed -e 's/^ *//g' | perl -pe 's/^Modulus=(.{2})(.{2})(.{2})(.{2})(.{2})(.{2})(.{2})(.{2})(.{2})(.{2})(.{2}).*$/Modulus: $1:$2:$3:$4:$5:$6:$7:$8:$9 .../' |perl -pe 's/,\sDNS:/\n  /g;s/^DNS:/SubjectAltNames:\n  /'
+  if [ $osslcmd = "x509" ]; then
+    openssl $osslcmd -serial -noout -in "$host" | sed -e 's/^serial=/Serial:  /'
+  fi
+else
+  echo "Hostname: $host"
+  if [ $quiet = 0 ]; then
+    openssl s_client $starttls -connect "$host":$port -showcerts < /dev/null 2>/dev/null  | openssl x509 -serial -text -modulus -noout | egrep '(Subject:|Issuer:|Not After|DNS|Modulus=|serial=)' | sed -e 's/^ *//g' | perl -pe 's/^Modulus=(.{2})(.{2})(.{2})(.{2})(.{2})(.{2})(.{2})(.{2})(.{2})(.{2})(.{2}).*$/Modulus: $1:$2:$3:$4:$5:$6:$7:$8:$9 .../'|perl -pe 's/,\sDNS:/\n  /g;s/^DNS:/SubjectAltNames:\n  /' | perl -pe 's/^serial=/Serial Number/ and $_ = (join ":",unpack "(A13)(A2)*", $_)."\n"'
+  else
+    openssl s_client $starttls -connect "$host":$port -showcerts < /dev/null 2>/dev/null  | openssl x509 -serial -text -modulus -noout | egrep '(Subject:|Issuer:|Not After|Modulus=|serial=)' | sed -e 's/^ *//g' | perl -pe 's/^Modulus=(.{2})(.{2})(.{2})(.{2})(.{2})(.{2})(.{2})(.{2})(.{2})(.{2})(.{2}).*$/Modulus: $1:$2:$3:$4:$5:$6:$7:$8:$9 .../'|perl -pe 's/,\sDNS:/\n  /g;s/^DNS:/SubjectAltNames:\n  /' | perl -pe 's/^serial=/Serial number: / and $_ = (join ":",unpack "(A13)(A2)*", $_)."\n"'
+  fi
+
+  echo "Certificate chain supplied by host:"
+  openssl s_client $starttls -connect "$host":$port 2>&1 < /dev/null | egrep '[si]:' 
+fi

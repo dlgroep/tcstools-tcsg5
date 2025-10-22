@@ -1,0 +1,470 @@
+#! /bin/bash
+#
+# @(#)nik-acme-certupdate version 1.2b (2024-11-12, updated 2025)
+#
+# Update (when needed) a certificate using the ACME protocol with pre-validated
+# domains, e.g., from the TCSG4 Sectigo ACME endpoints (but any EAB ACME endpoint
+# can be used).
+#
+# Copyright 2023-2024 David Groep, Nikhef (Stichting NWO-I), Amsterdam.
+#                     <davidg@nikhef.nl>
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#     http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Generated CertBot command:
+#   certbot certonly --standalone --non-interactive --agree-tos \
+#    --rsa-key-size 4096 --key-type rsa --email admin@example.com \
+#    --server https://acme.example.com/v2/GEANTOV \
+#    --eab-kid KID --eab-hmac-key HMAC \
+#    --cert-name `hostname -f` -d sub.domain.example.com
+#
+# The config file (/usr/local/etc/nik-acme-certupdate.config by default) should
+# contain at keast KID and HMAC, and may override the local defaults:
+#
+# KID=Dc1...
+# HMAC=mv_3kv....
+# CERTSERVER=https://acme.example.com
+# CERTNAME=`hostname -f`
+# DOMAINS=....
+# TARGETOWNER=openldap
+# TARGETGROUP=root
+# TARGETPERMS=0640
+# TARGETDIR=/etc/pki/tls/tcsg4
+# POSTRUN="systemctl reload httpd 2>&1 | logger"
+#
+# The "TARGETDIR" variable sets the place where consumers (like a web server 
+# daemon) will expect to find a stable set of keys and certificates. So you
+# should not point the web server to directly read from the things generated
+# by certbot. It matches the tcsg4-install-servercert.sh directory structure.
+#
+# This utility is particularly suited to be invoked from cron - it will just
+# check and do nothing unless there is actually actions required. It will not
+# even talk to the ACME endpoint if everything is fine. You can run it as 
+# often as you want, but typically:
+#
+#   45 8 * * 1,3,4 root /usr/local/bin/nik-acme-certupdate
+#
+# is a good startingpoint.
+# Note that this utility is supposed to be run as root, and only on trusted
+# directories. It uses mktemp(1) which should be safe, but if you're worried
+# make sure TMPDIR points to a private place as well before running this
+#
+# Prerequisites: bash, certbot, openssl [v1+], sed, date, mktemp, diff, logger
+#      Optional: tcsg4-clean-certchain [to remove antiquated certificate chain]
+#
+# The utility comes "AS IS," without a warranty of any kind. It is not intended
+# for certificate acquisition or manipulation, nor for any other purpose.
+#
+
+exec=
+logger="logger -t nik-acme-certupdate -p daemon.notice"
+OPTIONS="hfFnC:a:c:o:g:p:d:i:s:r:"
+
+CERTBOT=/usr/bin/certbot
+CERTSERVER=https://acme.example.com/v2/GEANTOV
+CERTBOTDIR=/etc/letsencrypt/live/
+CERTNAME=`hostname -f`
+CERTGRACEDAYS=11
+CERTFORCE=0
+CERTFULLFORCE=0
+CERTCHAINCLEANTOOL=tcsg4-clean-certchain
+KEYTYPE=rsa
+KEYSIZE=4096
+NOTIFY=root@`hostname -d`
+TARGETOWNER=root
+TARGETGROUP=root
+TARGETPERMS=0600
+TARGETDIR=/etc/pki/tls/tcsg4
+DRYRUN=0
+CONFIGFILES="/usr/local/etc/nik-acme-certupdate.config /etc/nik-acme-certupdate.config /etc/pki/tls/nik-acme-certupdate.config"
+OPENSSL=openssl
+
+# in case you have a non-GNU system, some of these may have to be pointed
+# to their GNU variant. The regular POSIX or BSD/7th edition variants may
+# not be enough
+SED=sed
+DATE=date
+GREP=grep
+
+help() {
+cat <<EOF
+Update and install an ACME acquired cert for local Nikhef use
+based on certbot and an explicit check on freshness and
+appropriateness (esp. for non-web servers)
+
+Usage: $0 [-h] [-C config] [-a acme_account] [-c certname] [-d targetdir]
+  [-o targetowner] [-g targetgroup] [-p targetperms (octal)]
+  [-s ACME-endpoint] [-i mailaddr] [-r postrun-command]
+  [-f] [-F] [-n] [host [<host> ...]]
+
+  -d targetdir      where to install the confirmed certificate and
+                    private key (default: $TARGETDIR)
+  -o targetowner    owner of installed key, cert/chain (default: $TARGETOWNER)
+  -g targetgroup    group of installed key, cert/chain (default: $TARGETGROUP)
+  -p perms          octal permissions of the private key (default: $TARGETPERMS)
+  -a acme_account   name of the acme client (cert-name for the certbot)
+                    defaults to FQDN of this host (i.e. $CERTNAME)
+  -c certname       name of the certificate file for reference (for certbot)
+                    defaults to FQDN of this host (i.e. $CERTNAME)
+  -i notifymail     email address for certbot notify ($NOTIFY)
+  -s server         EAB (default: $CERTSERVER)
+  -r command        command(script) to run after completion, e.g. to restart
+                    (no default, set in the config files)
+  -C configfile     read configuration from file (shell syntax, defaults
+                    to list below)
+  -f                force run of certbot even if not expiring in next $CERTGRACEDAYS days
+  -F                force renewal by certbot bypassing its builtin stand-off
+                    period (adds --force-renewal to certbot)
+  -n                dry-run: everything except for actually getting new cert
+
+  <host>            FQDN(s) to include in the certificate. The first one ends
+                    up in the commonName RDN. Must be authorized to the KID
+                    ** These REPALCE any pre-configured (config file) domains
+                    ** use WITH CARE as you can then no longer run autoupdate
+
+This tool will read (the first of) the following config files with shell syntax:
+    /usr/local/etc/nik-acme-certupdate.config
+    /etc/nik-acme-certupdate.config
+    /etc/pki/tls/nik-acme-certupdate.config
+
+EOF
+    return 0
+}
+
+# we must get the config file name from the -C option before reading the config
+while getopts "$OPTIONS" OPTION
+do
+  case $OPTION in
+  C ) CONFIGFILES="$OPTARG" ;;
+  esac
+done
+# allow re-parsing the options to override the config file defaults (except for -C <file>)
+unset OPTION OPTIND
+
+# read configuration data
+for config in $CONFIGFILES
+do
+  if [ -f "$config" ]
+  then
+    # basic (not comprehensive) sanity checks on config file integrity
+    configownergroup=`stat -c '%u:%g' "$config"`
+    configmode=`stat -c '%a' "$config"`
+    if [ "$configownergroup" != "0:0" ]; then
+      echo "ERROR: config file $config not owned by user and group root" >&2 ; exit 1
+    fi
+    if [ "$configmode" != "600" -a "$configmode" != "400" ]; then
+      echo "ERROR: config file $config permissions are not correct (must be 0600 or 0400)" >&2 ; exit 1
+    fi
+
+    echo "Using config $config"
+    $logger "Using config: $config"
+    . "$config"
+
+    break
+  fi
+done
+
+#
+# command-line options except for -C override config file settings
+#
+while getopts "$OPTIONS" OPTION
+do
+  case $OPTION in
+  h ) help ; exit 0 ;;
+  f ) CERTFORCE=1 ;;
+  F ) CERTFULLFORCE=1 ;;
+  n ) DRYRUN=1 ;;
+  C ) ;; # dont care about -C any more
+  a ) CERTACCOUNTNAME="$OPTARG" ;;
+  c ) CERTNAME="$OPTARG" ;;
+  o ) TARGETOWNER="$OPTARG" ;;
+  g ) TARGETGROUP="$OPTARG" ;;
+  p ) TARGETPERMS="$OPTARG" ;;
+  d ) TARGETDIR="$OPTARG" ;;
+  s ) CERTSERVER="$OPTARG" ;;
+  i ) NOTIFY="$OPTARG" ;;
+  r ) POSTRUN="$OPTARG" ;;
+  esac
+done
+shift $(expr $OPTIND - 1 )
+
+if [ -z "$KID" ]; then
+  echo "No EAB KeyID available, cannot proceed" >&2
+  $logger "No EAB KeyID available - exiting"
+  exit 1
+fi
+if [ -z "$HMAC" ]; then
+  echo "No EAB HMAC available, cannot proceed" >&2
+  $logger "No EAB HMAC available - exiting"
+  exit 1
+fi
+
+# the account name for ACME defaults to the certname (but may be different
+# depending on what was set in the EAB portal/SCM)
+CERTACCOUNTNAME="${CERTACCOUNTNAME:-$CERTNAME}"
+
+case "$#" in
+0 ) if [ -z "$DOMAINS" ]; then
+      echo "No domain names given, no-op will not proceed. Bye" >&2
+      $logger "No domain names given, no-op will not proceed"
+      exit 1
+    fi
+    ;;
+* ) DOMAINS="" ;;
+esac
+
+domainargs=""
+for domain in "$@" $DOMAINS
+do
+  case "$domain" in
+  *.* ) domainargs="$domainargs -d $domain"
+        domainlist="$domainlist $domain"
+        ;;
+  * )   echo "Invalid domain name $domain, terminating" >&2 ; exit 1 ;;
+  esac
+done
+domainlist=`echo "$domainlist" | $SED -e 's/^ *//;s/ *$//'`
+
+$logger "ACME renewal run for domains: $domainlist"
+
+# determine freshness
+hasnewdomains=0
+if [ -f "$TARGETDIR/cert-$CERTNAME.pem" ]; then
+  needsrenew=1
+
+  echo "Checking freshness ($CERTGRACEDAYS days) of $TARGETDIR/cert-$CERTNAME.pem"
+  $OPENSSL x509 -noout -in "$TARGETDIR/cert-$CERTNAME.pem" -checkend $(( $CERTGRACEDAYS * 86400 ))
+  if [ $? -eq 0 -a $CERTFORCE -eq 0 ]; then
+    echo "Current certificate still valid for at least $CERTGRACEDAYS days"
+    $logger "ACME renewal: current cert still valid for at least $CERTGRACEDAYS days"
+    needsrenew=0
+  fi
+
+  # can we check for completeness of the current certificate against the new domain list
+  currentsanlist=`mktemp -p ${TMPDIR:-/tmp} nik-acme-certupdate.sanlist.XXXXXXXXXX`
+  $OPENSSL x509 -noout -in "$TARGETDIR/cert-$CERTNAME.pem" -ext subjectAltName | \
+    $SED -e '/^[^ ]/d;/^X/d;s/DNS:\([a-z][-a-zA-Z0-9\.]*\)/\1/g;s/^ *//;s/, */\n/g' | \
+    sort  > $currentsanlist
+  newsanlist=`mktemp -p ${TMPDIR:-/tmp} nik-acme-certupdate.sanlist.XXXXXXXXXX`
+  echo "$domainlist" | $SED -e 's/  */\n/g;/^ *$/d' | sort | $GREP -e . > $newsanlist
+  diff -q -w $currentsanlist $newsanlist > /dev/null 2>&1
+  if [ $? -ne 0 ]; then
+    echo "Domain list has changed, need to request a new certificate"
+    echo "Domain list difference:"
+    diff -dwtc0 -W70 $currentsanlist $newsanlist | $GREP -e '^. '
+    $logger "ACME renewal: domain list has changed, request new certificate"
+    diff -dwtc0 -W70 $currentsanlist $newsanlist | $GREP -e '^. ' | while read x ; do $logger "ACME renewal: domain change $x" ; done
+    #rm $currentsanlist $newsanlist
+    needsrenew=1
+    hasnewdomains=1
+  fi
+
+  if [ $needsrenew -eq 0 ]; then
+    echo "No action needed, terminating update process"
+    $logger "ACME renewal: no action needed, all certs still valid and correct"
+    exit 0
+  fi
+fi
+
+echo "Acquiring certificates for $domainlist"
+$logger "ACME renewal: acquiring certificates for $domainlist"
+
+if [ "$DRYRUN" -eq 0 ]; then
+  echo "Acquiring certificate from $CERTSERVER"
+  $logger "ACME renewal: acquiring certificate from $CERTSERVER"
+  renewforce=""
+  if [ $CERTFULLFORCE -ne 0 ]; then
+    echo "ACME renewal: forcing certbot renewal"
+    $logger "ACME renewal: forcing certbot renewal"
+    renewforce=" --force-renewal"
+  fi
+  $exec certbot certonly --standalone $renewforce --non-interactive --agree-tos \
+    --key-type "$KEYTYPE" --rsa-key-size "$KEYSIZE" \
+    --cert-name "$CERTACCOUNTNAME" --email "$NOTIFY" \
+    --server "$CERTSERVER" \
+    --eab-kid "$KID" \
+    --eab-hmac-key "$HMAC" \
+    $domainargs
+  rc=$?
+else
+  echo "DRYRUN: not getting a new certificate from $CERTSERVER"
+  $logger "ACME DRYRUN: not getting a new certificate from $CERTSERVER"
+  rc=0
+fi
+
+$logger "ACME renewal: return code $rc"
+
+if [ $rc -ne 0 ]; then
+  echo "ERROR: certbot terminated unexpectedly (rc=$rc)"
+  echo "       continuing could be desastrous, so we bail now"
+  echo "       please review status for $CERTBOTDIR/$CERTACCOUNTNAME"
+  $logger "ACME renewal: failed"
+  exit $rc
+fi
+
+# did we get a certificate?
+$OPENSSL x509 -noout -in "$CERTBOTDIR/$CERTACCOUNTNAME/cert.pem" > /dev/null 2>&1
+if [ $? -ne 0 ]; then
+  echo "Not a certificate: $CERTBOTDIR/$CERTACCOUNTNAME/cert.pem" >&2
+  $logger "ACME cert installation: not a certificate"
+  exit 2
+fi
+$OPENSSL x509 -noout -in "$CERTBOTDIR/$CERTACCOUNTNAME/chain.pem" > /dev/null 2>&1
+if [ $? -ne 0 ]; then
+  echo "Not a certificate: $CERTBOTDIR/$CERTACCOUNTNAME/chain.pem" >&2
+  $logger "ACME cert installation: not a chain certificate"
+  exit 2
+fi
+$OPENSSL rsa -noout -in "$CERTBOTDIR/$CERTACCOUNTNAME/privkey.pem" > /dev/null 2>&1
+if [ $? -ne 0 ]; then
+  $OPENSSL ec -noout -in "$CERTBOTDIR/$CERTACCOUNTNAME/privkey.pem" > /dev/null 2>&1
+  if [ $? -ne 0 ]; then
+    echo "Not an RSA or ECC key: $CERTBOTDIR/$CERTACCOUNTNAME/privkey.pem" >&2
+    $logger "ACME cert installation: not a valid private key"
+    exit 2
+  fi
+fi
+
+# ############################################################################
+# target directory is part of the SoLR default setups for certificate install
+# in line with the tcsg4 tcstools
+#
+if [ ! -d "$TARGETDIR" ]; then
+  echo "Creating $TARGETDIR for managed certificate storage"
+  $logger "ACME cert installation: creating installation directory $TARGETDIR"
+  mkdir -p "$TARGETDIR"
+  chown root:root "$TARGETDIR"
+fi
+
+# does openssl have a dateopt - if so use it, if not, lets hope we have GNU date
+if [ `$OPENSSL x509 -help 2>&1 | $GREP -c dateopt` -ne 0 ]; then
+  live_endtime=`$OPENSSL x509 -in "$CERTBOTDIR/$CERTACCOUNTNAME/cert.pem" -noout -enddate -dateopt iso_8601 | $SED -e 's/.*=//'`
+  current_endtime=`$OPENSSL x509 -in "$TARGETDIR/cert-$CERTNAME.pem" -noout -enddate -dateopt iso_8601 | $SED -e 's/.*=//'`
+else
+  live_endtime=`$OPENSSL x509 -in "$CERTBOTDIR/$CERTACCOUNTNAME/cert.pem" -noout -enddate | $SED -e 's/.*=//' | $DATE -f - -u "+%Y-%m-%d %H:%M:%SZ"`
+  current_endtime=`$OPENSSL x509 -in "$TARGETDIR/cert-$CERTNAME.pem" -noout -enddate | $SED -e 's/.*=//' | $DATE -f - -u "+%Y-%m-%d %H:%M:%SZ"`
+fi
+
+if [ $hasnewdomains -eq 0 -a `expr "$live_endtime" "<=" "$current_endtime"` != "0" ]; then
+  echo "New certificate end time ($live_endtime) is same or earlier than current ($current_endtime)"
+  echo "No need for action"
+  $logger "ACME cert installation: new certificate end time ($live_endtime) is earlier than current ($current_endtime). No action needed"
+  exit 0
+fi
+
+NOW=`$DATE "+%Y%m%dT%H%M%SL"`
+
+echo "Installing new certificate for $CERTNAME (and SANs) in $TARGETDIR"
+echo "... today is $NOW"
+echo "... new cert valid until $live_endtime"
+
+$logger "ACME cert installation: installing new certificate valid until $live_endtime"
+
+for type in key cert chain nginx
+do
+  if [ -f "$TARGETDIR/$type-$CERTNAME.pem" ]; then
+    echo "... backup $TARGETDIR/$type-$CERTNAME.pem"
+    $logger "ACME cert installation: backing up $TARGETDIR/$type-$CERTNAME.pem"
+    mv "$TARGETDIR/$type-$CERTNAME.pem" "$TARGETDIR/$type-$CERTNAME.pem.bck-$NOW"
+  fi
+done
+
+touch "$TARGETDIR/key-$CERTNAME.pem"
+chown $TARGETOWNER:$TARGETGROUP "$TARGETDIR/key-$CERTNAME.pem"
+if [ `stat -c '%U' "$TARGETDIR/key-$CERTNAME.pem"` != "$TARGETOWNER" ]; then
+  echo "FATAL ERROR: key file $TARGETDIR/key-$CERTNAME.pem could not be chowned to $TARGETOWNER"
+  $logger "ACME cert installation: FATAL ERROR: key file $TARGETDIR/key-$CERTNAME.pem could not be chowned to $TARGETOWNER"
+  echo "attempting recovery"
+  for type in key cert chain nginx
+  do
+    if [ -f "$TARGETDIR/$type-$CERTNAME.pem" ]; then
+      echo "... restore $TARGETDIR/$type-$CERTNAME.pem"
+      $logger "ACME cert installation: attempting restore of $TARGETDIR/$type-$CERTNAME.pem"
+      mv -f "$TARGETDIR/$type-$CERTNAME.pem.bck-$NOW" "$TARGETDIR/$type-$CERTNAME.pem"
+    fi
+  done
+  exit 1
+fi
+
+chmod $TARGETPERMS "$TARGETDIR/key-$CERTNAME.pem"
+$logger "ACME cert installation: protecting private key $TARGETDIR/key-$CERTNAME.pem with $TARGETPERMS"
+
+echo "... installing private key"
+$logger "ACME cert installation: installing private key"
+cat $CERTBOTDIR/$CERTACCOUNTNAME/privkey.pem >> "$TARGETDIR/key-$CERTNAME.pem"
+
+echo "... installing certificate"
+$logger "ACME cert installation: installing certificate"
+cat $CERTBOTDIR/$CERTACCOUNTNAME/cert.pem > "$TARGETDIR/cert-$CERTNAME.pem"
+
+echo "... installing chain"
+
+# can we clean the certificate chain from Sectigo old root dependencies
+type $CERTCHAINCLEANTOOL > /dev/null 2>&1
+if [ $? -eq 0 ]; then
+  echo "    attempt cleaning chain with $CERTCHAINCLEANTOOL"
+  $logger "ACME cert installation: cleaning chain using $CERTCHAINCLEANTOOL"
+  $CERTCHAINCLEANTOOL < $CERTBOTDIR/$CERTACCOUNTNAME/chain.pem > "$TARGETDIR/chain-$CERTNAME.pem.cleaned"
+  if [ $? -ne 0 ]; then
+    echo "    chain could not be cleaned, error in cleaner script: installing original chain"
+    $logger "ACME cert installation: chain could not be cleaned, error in cleaner script"
+    $logger "ACME cert installation: installing original chain"
+    rm "$TARGETDIR/chain-$CERTNAME.pem.cleaned"
+    cat $CERTBOTDIR/$CERTACCOUNTNAME/chain.pem > "$TARGETDIR/chain-$CERTNAME.pem"
+  else
+    if [ -s "$TARGETDIR/chain-$CERTNAME.pem.cleaned" ]; then
+      echo "    installing cleaned chain"
+      $logger "ACME cert installation: installing cleaned chain"
+      mv "$TARGETDIR/chain-$CERTNAME.pem.cleaned" "$TARGETDIR/chain-$CERTNAME.pem"
+    else
+      echo "    cleaned chain was zero length - something went wrong: installing original chain"
+      $logger "ACME cert installation: cleaned chain was zero length - something went wrong"
+      $logger "ACME cert installation: installing original chain"
+      rm "$TARGETDIR/chain-$CERTNAME.pem.cleaned"
+      cat $CERTBOTDIR/$CERTACCOUNTNAME/chain.pem > "$TARGETDIR/chain-$CERTNAME.pem"
+    fi
+  fi
+else
+  $logger "ACME cert installation: installing chain"
+  cat $CERTBOTDIR/$CERTACCOUNTNAME/chain.pem > "$TARGETDIR/chain-$CERTNAME.pem"
+fi
+
+
+echo "... installing nginx combined cert chain"
+$logger "ACME cert installation: installing nginx combined cert chain"
+cat "$TARGETDIR/cert-$CERTNAME.pem" "$TARGETDIR/chain-$CERTNAME.pem" > "$TARGETDIR/nginx-$CERTNAME.pem"
+
+
+if [ -n "$POSTRUN" ]; then
+  echo "... executing command: \"$POSTRUN\""
+  $logger "ACME postinstall: executing $POSTRUN"
+  ( $POSTRUN )
+  rc=$?
+  echo "... post-run command returns: $rc"
+  $logger "ACME postinstall: completed with rc=$rc"
+fi
+
+echo "Done."
+$logger "ACME renewal: done"
+
+
+# ###########################################################################
+# CHANGES
+#
+# version 1.2 (2024-11-12)
+#   - add FullForce (certbot --force-renewal) option
+# version 1.1 (2024-04-04)
+#   -  add documentation and make available in public repositories
+# version 1.0
+#   - Nikhef SoLR version crafted
+#
