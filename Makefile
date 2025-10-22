@@ -5,7 +5,7 @@
 #
 all: install
 
-FILES=tcsg5-apitool
+FILES=tcsg5-apitool districert.sh listcerts.sh nik-acme-certupdate probecert
 DOCFILES=README.txt
 
 install:
