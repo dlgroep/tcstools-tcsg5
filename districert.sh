@@ -30,6 +30,7 @@ srcdir=.
 destdir=tcsg4
 pkgmngr="yum"
 keyperms=0600
+samekey=0
 
 usage() {
 cat <<EOF
@@ -49,13 +50,14 @@ Usage: $0 [-R] [-d destdir (tcsg4)] [-p destpath (/root)] [-U user]
   -A      use apt-get, not yum, to ensure remote rsync is present
   -H      run "systemctl restart httpd" on the target afterwards
   -S srv  run "systemctl restart <srv>" on the target afterwards
+  -i      ignore missing private key (e.g. in case of re-use of same key)
 
 EOF
   exit 1;
 }
 
 
-while getopts "s:d:p:RhAHS:U:O:K:" o
+while getopts "s:d:p:RhAHS:U:O:K:i" o
 do
   case "${o}" in
     U ) CPUSER="${OPTARG}" ;;
@@ -68,6 +70,7 @@ do
     R ) destpath=/etc/pki/tls ;;
     A ) pkgmngr=apt ;;
     s ) srcdir=${OPTARG} ;;
+    i ) samekey=1 ;;
     h ) usage ;;
   esac
 done
@@ -79,18 +82,36 @@ else
   CPPATH=/home/$CPUSER
 fi
 
-c=`ls ${srcdir}/key*pem 2>/dev/null |wc -l`
-if [ $c -ne 1 ]; then
-  echo "Too many or too few keys here in ${srcdir} - cd into source first" >&2
-  exit 1
+if [ $samekey -eq 0 ]; then
+    c=`ls ${srcdir}/key*pem 2>/dev/null |wc -l`
+    if [ $c -ne 1 ]; then
+      echo "Too many or too few keys here in ${srcdir} - cd into source first" >&2
+      exit 1
+    fi
+    fn=${1:-`ls -1 ${srcdir}/key-*.pem | sed -e 's/.*key-\(.*\)\.pem/\1/'`}
+else
+    # base on cert- name if key is not to be used
+    c=`ls ${srcdir}/cert-*pem 2>/dev/null |wc -l`
+    if [ $c -ne 1 ]; then
+      echo "Too many or too few certs here in ${srcdir} - cd into source first" >&2
+      exit 1
+    fi
+    fn=${1:-`ls -1 ${srcdir}/cert-*.pem | sed -e 's/.*cert-\(.*\)\.pem/\1/'`}
 fi
-
-fn=${1:-`ls -1 ${srcdir}/key-*.pem | sed -e 's/.*key-\(.*\)\.pem/\1/'`}
 
 echo Installing to host $fn
 
-ping -q -w 20 -c 1 $fn > /dev/null 2>&1
-if [ $? -ne 0 ]; then
+WinPing=`ping -h 2>&1 |grep -c ' -i TTL'`
+pingrc=0
+
+if [ $WinPing -eq 0 ]; then
+    ping -q -w 20 -c 1 $fn > /dev/null 2>&1
+    pingrc=$?
+else
+    ping -w 20 -n 1 $fn > /dev/null 2>&1
+    pingrc=$?
+fi
+if [ $pingrc -ne 0 ]; then
   echo "ERROR: cannot ping $fn" >&2
   exit 1
 fi
@@ -117,8 +138,10 @@ rsync -rav ${srcdir}/ ${CPUSER}@"$fn":$CPPATH/$destdir/
 
 OWNER=${OWNER:-"$CPUSER:$CPUSER"}
 
-echo "setting $keyperms ($OWNER) permissions on $CPPATH/$destdir/key\* ..."
-ssh ${CPUSER}@"$fn" "chmod $keyperms $CPPATH/$destdir/key* ; chmod $keyperms $CPPATH/$destdir/*.p12 ; chown -R $OWNER $CPPATH/$destdir"
+if [ $samekey -eq 0 ]; then
+    echo "setting $keyperms ($OWNER) permissions on $CPPATH/$destdir/key\* ..."
+    ssh ${CPUSER}@"$fn" "chmod $keyperms $CPPATH/$destdir/key* ; chmod $keyperms $CPPATH/$destdir/*.p12 ; chown -R $OWNER $CPPATH/$destdir"
+fi
 
 if [ "$httpdrestart" != "" ]; then
   if [ $CPUSER = root ]; then

@@ -55,6 +55,7 @@ local $::cm_endpoint = "https://cm-stg.harica.gr";
 local $::tokenname = "HARICA STG MYSELF";
 local $::orgname = undef;
 local $::csrfile="AUTO";
+local $::allowreuse=undef;
 local $::profile="OV";
 local $::igtf=undef;
 local $::keytype="rsa:4096";
@@ -96,6 +97,7 @@ foreach my $cfgfile (
   'U|username=s' => \$::cmusername,
   'O|orgname|organizationName=s' => \$::orgname,
   'R|req|csr=s' => \$::csrfile,
+  'S|samekey' => \$::allowreuse,
   'certprofile=s' => \$::profile,
   'd|basedir=s' => \$::basedir,
   'F|name=s' => \$friendlyname,
@@ -466,7 +468,7 @@ sub harica_req_build() {
     my %formdata = (
         "friendlyName" => $name,
         "transactionType" => $::profile,
-        "consentSameKey" => "false",
+        "consentSameKey" => ($::allowreuse?"true":"false"),
         "isManualCSR" => "true",
         "duration" => 1,
         "csr" => $csr,
@@ -814,7 +816,7 @@ tcsg5-apitool - HARICA API for TCS Gen5 commissioning
 
 Usage: $progname [-s andOTPfile.json] [-e endpoint] [-t tokenname]
     [-P passwordfile] [-U user_email] [-R csrfile_pem] [-h] [-n] [-v[v]]
-    [-O orgname] [--profile (OV|EV|DV)] [-F friendlyname]
+    [-O orgname] [--profile (OV|EV|DV)] [-F friendlyname] [-G] [-S|samekey]
     <COMMAND> <commandargs> ...
 
     -U email        email address of the user in the portal
@@ -829,6 +831,8 @@ Usage: $progname [-s andOTPfile.json] [-e endpoint] [-t tokenname]
     --profile xv    Set cert profile to OV, EV, DV, ... (default $::profile)
     -d dir          base directory for per-certificate/request directories
     -A              create advanced formats on download (requires openssl)
+    -G | --igtf     request IGTF profile
+    -S | --samekey  allow private key re-use
     -pkcs12_opts op add <op> as extra options to the openssl pkcs12 -export
                     command line (e.g. "-passout pass:plain")
     -e url          HARICA API endpoint ($::cm_endpoint)
